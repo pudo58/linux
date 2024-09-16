@@ -36,7 +36,36 @@ EXPORT_SYMBOL(generic_ro_fops);
 
 static inline bool unsigned_offsets(struct file *file)
 {
-	return file->f_mode & FMODE_UNSIGNED_OFFSET;
+	return file->f_op->fop_flags & FOP_UNSIGNED_OFFSET;
+}
+
+/**
+ * vfs_setpos_cookie - update the file offset for lseek and reset cookie
+ * @file:	file structure in question
+ * @offset:	file offset to seek to
+ * @maxsize:	maximum file size
+ * @cookie:	cookie to reset
+ *
+ * Update the file offset to the value specified by @offset if the given
+ * offset is valid and it is not equal to the current file offset and
+ * reset the specified cookie to indicate that a seek happened.
+ *
+ * Return the specified offset on success and -EINVAL on invalid offset.
+ */
+static loff_t vfs_setpos_cookie(struct file *file, loff_t offset,
+				loff_t maxsize, u64 *cookie)
+{
+	if (offset < 0 && !unsigned_offsets(file))
+		return -EINVAL;
+	if (offset > maxsize)
+		return -EINVAL;
+
+	if (offset != file->f_pos) {
+		file->f_pos = offset;
+		if (cookie)
+			*cookie = 0;
+	}
+	return offset;
 }
 
 /**
@@ -53,25 +82,69 @@ static inline bool unsigned_offsets(struct file *file)
  */
 loff_t vfs_setpos(struct file *file, loff_t offset, loff_t maxsize)
 {
-	if (offset < 0 && !unsigned_offsets(file))
-		return -EINVAL;
-	if (offset > maxsize)
-		return -EINVAL;
-
-	if (offset != file->f_pos) {
-		file->f_pos = offset;
-		file->f_version = 0;
-	}
-	return offset;
+	return vfs_setpos_cookie(file, offset, maxsize, NULL);
 }
 EXPORT_SYMBOL(vfs_setpos);
+
+/**
+ * must_set_pos - check whether f_pos has to be updated
+ * @file: file to seek on
+ * @offset: offset to use
+ * @whence: type of seek operation
+ * @eof: end of file
+ *
+ * Check whether f_pos needs to be updated and update @offset according
+ * to @whence.
+ *
+ * Return: 0 if f_pos doesn't need to be updated, 1 if f_pos has to be
+ * updated, and negative error code on failure.
+ */
+static int must_set_pos(struct file *file, loff_t *offset, int whence, loff_t eof)
+{
+	switch (whence) {
+	case SEEK_END:
+		*offset += eof;
+		break;
+	case SEEK_CUR:
+		/*
+		 * Here we special-case the lseek(fd, 0, SEEK_CUR)
+		 * position-querying operation.  Avoid rewriting the "same"
+		 * f_pos value back to the file because a concurrent read(),
+		 * write() or lseek() might have altered it
+		 */
+		if (*offset == 0) {
+			*offset = file->f_pos;
+			return 0;
+		}
+		break;
+	case SEEK_DATA:
+		/*
+		 * In the generic case the entire file is data, so as long as
+		 * offset isn't at the end of the file then the offset is data.
+		 */
+		if ((unsigned long long)*offset >= eof)
+			return -ENXIO;
+		break;
+	case SEEK_HOLE:
+		/*
+		 * There is a virtual hole at the end of the file, so as long as
+		 * offset isn't i_size or larger, return i_size.
+		 */
+		if ((unsigned long long)*offset >= eof)
+			return -ENXIO;
+		*offset = eof;
+		break;
+	}
+
+	return 1;
+}
 
 /**
  * generic_file_llseek_size - generic llseek implementation for regular files
  * @file:	file structure to seek on
  * @offset:	file offset to seek to
  * @whence:	type of seek
- * @size:	max size of this file in file system
+ * @maxsize:	max size of this file in file system
  * @eof:	offset used for SEEK_END position
  *
  * This is a variant of generic_file_llseek that allows passing in a custom
@@ -86,50 +159,72 @@ loff_t
 generic_file_llseek_size(struct file *file, loff_t offset, int whence,
 		loff_t maxsize, loff_t eof)
 {
-	switch (whence) {
-	case SEEK_END:
-		offset += eof;
-		break;
-	case SEEK_CUR:
-		/*
-		 * Here we special-case the lseek(fd, 0, SEEK_CUR)
-		 * position-querying operation.  Avoid rewriting the "same"
-		 * f_pos value back to the file because a concurrent read(),
-		 * write() or lseek() might have altered it
-		 */
-		if (offset == 0)
-			return file->f_pos;
-		/*
-		 * f_lock protects against read/modify/write race with other
-		 * SEEK_CURs. Note that parallel writes and reads behave
-		 * like SEEK_SET.
-		 */
-		spin_lock(&file->f_lock);
-		offset = vfs_setpos(file, file->f_pos + offset, maxsize);
-		spin_unlock(&file->f_lock);
+	int ret;
+
+	ret = must_set_pos(file, &offset, whence, eof);
+	if (ret < 0)
+		return ret;
+	if (ret == 0)
 		return offset;
-	case SEEK_DATA:
+
+	if (whence == SEEK_CUR) {
 		/*
-		 * In the generic case the entire file is data, so as long as
-		 * offset isn't at the end of the file then the offset is data.
+		 * f_lock protects against read/modify/write race with
+		 * other SEEK_CURs. Note that parallel writes and reads
+		 * behave like SEEK_SET.
 		 */
-		if ((unsigned long long)offset >= eof)
-			return -ENXIO;
-		break;
-	case SEEK_HOLE:
-		/*
-		 * There is a virtual hole at the end of the file, so as long as
-		 * offset isn't i_size or larger, return i_size.
-		 */
-		if ((unsigned long long)offset >= eof)
-			return -ENXIO;
-		offset = eof;
-		break;
+		guard(spinlock)(&file->f_lock);
+		return vfs_setpos(file, file->f_pos + offset, maxsize);
 	}
 
 	return vfs_setpos(file, offset, maxsize);
 }
 EXPORT_SYMBOL(generic_file_llseek_size);
+
+/**
+ * generic_llseek_cookie - versioned llseek implementation
+ * @file:	file structure to seek on
+ * @offset:	file offset to seek to
+ * @whence:	type of seek
+ * @cookie:	cookie to update
+ *
+ * See generic_file_llseek for a general description and locking assumptions.
+ *
+ * In contrast to generic_file_llseek, this function also resets a
+ * specified cookie to indicate a seek took place.
+ */
+loff_t generic_llseek_cookie(struct file *file, loff_t offset, int whence,
+			     u64 *cookie)
+{
+	struct inode *inode = file->f_mapping->host;
+	loff_t maxsize = inode->i_sb->s_maxbytes;
+	loff_t eof = i_size_read(inode);
+	int ret;
+
+	if (WARN_ON_ONCE(!cookie))
+		return -EINVAL;
+
+	/*
+	 * Require that this is only used for directories that guarantee
+	 * synchronization between readdir and seek so that an update to
+	 * @cookie is correctly synchronized with concurrent readdir.
+	 */
+	if (WARN_ON_ONCE(!(file->f_mode & FMODE_ATOMIC_POS)))
+		return -EINVAL;
+
+	ret = must_set_pos(file, &offset, whence, eof);
+	if (ret < 0)
+		return ret;
+	if (ret == 0)
+		return offset;
+
+	/* No need to hold f_lock because we know that f_pos_lock is held. */
+	if (whence == SEEK_CUR)
+		return vfs_setpos_cookie(file, file->f_pos + offset, maxsize, cookie);
+
+	return vfs_setpos_cookie(file, offset, maxsize, cookie);
+}
+EXPORT_SYMBOL(generic_llseek_cookie);
 
 /**
  * generic_file_llseek - generic llseek implementation for regular files
@@ -270,10 +365,8 @@ loff_t default_llseek(struct file *file, loff_t offset, int whence)
 	}
 	retval = -EINVAL;
 	if (offset >= 0 || unsigned_offsets(file)) {
-		if (offset != file->f_pos) {
+		if (offset != file->f_pos)
 			file->f_pos = offset;
-			file->f_version = 0;
-		}
 		retval = offset;
 	}
 out:
@@ -354,6 +447,9 @@ out_putf:
 
 int rw_verify_area(int read_write, struct file *file, const loff_t *ppos, size_t count)
 {
+	int mask = read_write == READ ? MAY_READ : MAY_WRITE;
+	int ret;
+
 	if (unlikely((ssize_t) count < 0))
 		return -EINVAL;
 
@@ -371,8 +467,11 @@ int rw_verify_area(int read_write, struct file *file, const loff_t *ppos, size_t
 		}
 	}
 
-	return security_file_permission(file,
-				read_write == READ ? MAY_READ : MAY_WRITE);
+	ret = security_file_permission(file, mask);
+	if (ret)
+		return ret;
+
+	return fsnotify_file_area_perm(file, mask, ppos, count);
 }
 EXPORT_SYMBOL(rw_verify_area);
 
@@ -386,7 +485,7 @@ static ssize_t new_sync_read(struct file *filp, char __user *buf, size_t len, lo
 	kiocb.ki_pos = (ppos ? *ppos : 0);
 	iov_iter_ubuf(&iter, ITER_DEST, buf, len);
 
-	ret = call_read_iter(filp, &kiocb, &iter);
+	ret = filp->f_op->read_iter(&kiocb, &iter);
 	BUG_ON(ret == -EIOCBQUEUED);
 	if (ppos)
 		*ppos = kiocb.ki_pos;
@@ -488,7 +587,7 @@ static ssize_t new_sync_write(struct file *filp, const char __user *buf, size_t 
 	kiocb.ki_pos = (ppos ? *ppos : 0);
 	iov_iter_ubuf(&iter, ITER_SOURCE, (void __user *)buf, len);
 
-	ret = call_write_iter(filp, &kiocb, &iter);
+	ret = filp->f_op->write_iter(&kiocb, &iter);
 	BUG_ON(ret == -EIOCBQUEUED);
 	if (ret > 0 && ppos)
 		*ppos = kiocb.ki_pos;
@@ -724,15 +823,15 @@ static ssize_t do_iter_readv_writev(struct file *filp, struct iov_iter *iter,
 	ssize_t ret;
 
 	init_sync_kiocb(&kiocb, filp);
-	ret = kiocb_set_rw_flags(&kiocb, flags);
+	ret = kiocb_set_rw_flags(&kiocb, flags, type);
 	if (ret)
 		return ret;
 	kiocb.ki_pos = (ppos ? *ppos : 0);
 
 	if (type == READ)
-		ret = call_read_iter(filp, &kiocb, iter);
+		ret = filp->f_op->read_iter(&kiocb, iter);
 	else
-		ret = call_write_iter(filp, &kiocb, iter);
+		ret = filp->f_op->write_iter(&kiocb, iter);
 	BUG_ON(ret == -EIOCBQUEUED);
 	if (ppos)
 		*ppos = kiocb.ki_pos;
@@ -773,34 +872,6 @@ static ssize_t do_loop_readv_writev(struct file *filp, struct iov_iter *iter,
 	return ret;
 }
 
-static ssize_t do_iter_read(struct file *file, struct iov_iter *iter,
-		loff_t *pos, rwf_t flags)
-{
-	size_t tot_len;
-	ssize_t ret = 0;
-
-	if (!(file->f_mode & FMODE_READ))
-		return -EBADF;
-	if (!(file->f_mode & FMODE_CAN_READ))
-		return -EINVAL;
-
-	tot_len = iov_iter_count(iter);
-	if (!tot_len)
-		goto out;
-	ret = rw_verify_area(READ, file, pos, tot_len);
-	if (ret < 0)
-		return ret;
-
-	if (file->f_op->read_iter)
-		ret = do_iter_readv_writev(file, iter, pos, READ, flags);
-	else
-		ret = do_loop_readv_writev(file, iter, pos, READ, flags);
-out:
-	if (ret >= 0)
-		fsnotify_access(file);
-	return ret;
-}
-
 ssize_t vfs_iocb_iter_read(struct file *file, struct kiocb *iocb,
 			   struct iov_iter *iter)
 {
@@ -821,7 +892,7 @@ ssize_t vfs_iocb_iter_read(struct file *file, struct kiocb *iocb,
 	if (ret < 0)
 		return ret;
 
-	ret = call_read_iter(file, iocb, iter);
+	ret = file->f_op->read_iter(iocb, iter);
 out:
 	if (ret >= 0)
 		fsnotify_access(file);
@@ -830,41 +901,37 @@ out:
 EXPORT_SYMBOL(vfs_iocb_iter_read);
 
 ssize_t vfs_iter_read(struct file *file, struct iov_iter *iter, loff_t *ppos,
-		rwf_t flags)
-{
-	if (!file->f_op->read_iter)
-		return -EINVAL;
-	return do_iter_read(file, iter, ppos, flags);
-}
-EXPORT_SYMBOL(vfs_iter_read);
-
-static ssize_t do_iter_write(struct file *file, struct iov_iter *iter,
-		loff_t *pos, rwf_t flags)
+		      rwf_t flags)
 {
 	size_t tot_len;
 	ssize_t ret = 0;
 
-	if (!(file->f_mode & FMODE_WRITE))
+	if (!file->f_op->read_iter)
+		return -EINVAL;
+	if (!(file->f_mode & FMODE_READ))
 		return -EBADF;
-	if (!(file->f_mode & FMODE_CAN_WRITE))
+	if (!(file->f_mode & FMODE_CAN_READ))
 		return -EINVAL;
 
 	tot_len = iov_iter_count(iter);
 	if (!tot_len)
-		return 0;
-	ret = rw_verify_area(WRITE, file, pos, tot_len);
+		goto out;
+	ret = rw_verify_area(READ, file, ppos, tot_len);
 	if (ret < 0)
 		return ret;
 
-	if (file->f_op->write_iter)
-		ret = do_iter_readv_writev(file, iter, pos, WRITE, flags);
-	else
-		ret = do_loop_readv_writev(file, iter, pos, WRITE, flags);
-	if (ret > 0)
-		fsnotify_modify(file);
+	ret = do_iter_readv_writev(file, iter, ppos, READ, flags);
+out:
+	if (ret >= 0)
+		fsnotify_access(file);
 	return ret;
 }
+EXPORT_SYMBOL(vfs_iter_read);
 
+/*
+ * Caller is responsible for calling kiocb_end_write() on completion
+ * if async iocb was queued.
+ */
 ssize_t vfs_iocb_iter_write(struct file *file, struct kiocb *iocb,
 			    struct iov_iter *iter)
 {
@@ -885,7 +952,10 @@ ssize_t vfs_iocb_iter_write(struct file *file, struct kiocb *iocb,
 	if (ret < 0)
 		return ret;
 
-	ret = call_write_iter(file, iocb, iter);
+	kiocb_start_write(iocb);
+	ret = file->f_op->write_iter(iocb, iter);
+	if (ret != -EIOCBQUEUED)
+		kiocb_end_write(iocb);
 	if (ret > 0)
 		fsnotify_modify(file);
 
@@ -894,46 +964,111 @@ ssize_t vfs_iocb_iter_write(struct file *file, struct kiocb *iocb,
 EXPORT_SYMBOL(vfs_iocb_iter_write);
 
 ssize_t vfs_iter_write(struct file *file, struct iov_iter *iter, loff_t *ppos,
-		rwf_t flags)
+		       rwf_t flags)
 {
+	size_t tot_len;
+	ssize_t ret;
+
+	if (!(file->f_mode & FMODE_WRITE))
+		return -EBADF;
+	if (!(file->f_mode & FMODE_CAN_WRITE))
+		return -EINVAL;
 	if (!file->f_op->write_iter)
 		return -EINVAL;
-	return do_iter_write(file, iter, ppos, flags);
+
+	tot_len = iov_iter_count(iter);
+	if (!tot_len)
+		return 0;
+
+	ret = rw_verify_area(WRITE, file, ppos, tot_len);
+	if (ret < 0)
+		return ret;
+
+	file_start_write(file);
+	ret = do_iter_readv_writev(file, iter, ppos, WRITE, flags);
+	if (ret > 0)
+		fsnotify_modify(file);
+	file_end_write(file);
+
+	return ret;
 }
 EXPORT_SYMBOL(vfs_iter_write);
 
 static ssize_t vfs_readv(struct file *file, const struct iovec __user *vec,
-		  unsigned long vlen, loff_t *pos, rwf_t flags)
+			 unsigned long vlen, loff_t *pos, rwf_t flags)
 {
 	struct iovec iovstack[UIO_FASTIOV];
 	struct iovec *iov = iovstack;
 	struct iov_iter iter;
-	ssize_t ret;
+	size_t tot_len;
+	ssize_t ret = 0;
 
-	ret = import_iovec(ITER_DEST, vec, vlen, ARRAY_SIZE(iovstack), &iov, &iter);
-	if (ret >= 0) {
-		ret = do_iter_read(file, &iter, pos, flags);
-		kfree(iov);
-	}
+	if (!(file->f_mode & FMODE_READ))
+		return -EBADF;
+	if (!(file->f_mode & FMODE_CAN_READ))
+		return -EINVAL;
 
+	ret = import_iovec(ITER_DEST, vec, vlen, ARRAY_SIZE(iovstack), &iov,
+			   &iter);
+	if (ret < 0)
+		return ret;
+
+	tot_len = iov_iter_count(&iter);
+	if (!tot_len)
+		goto out;
+
+	ret = rw_verify_area(READ, file, pos, tot_len);
+	if (ret < 0)
+		goto out;
+
+	if (file->f_op->read_iter)
+		ret = do_iter_readv_writev(file, &iter, pos, READ, flags);
+	else
+		ret = do_loop_readv_writev(file, &iter, pos, READ, flags);
+out:
+	if (ret >= 0)
+		fsnotify_access(file);
+	kfree(iov);
 	return ret;
 }
 
 static ssize_t vfs_writev(struct file *file, const struct iovec __user *vec,
-		   unsigned long vlen, loff_t *pos, rwf_t flags)
+			  unsigned long vlen, loff_t *pos, rwf_t flags)
 {
 	struct iovec iovstack[UIO_FASTIOV];
 	struct iovec *iov = iovstack;
 	struct iov_iter iter;
-	ssize_t ret;
+	size_t tot_len;
+	ssize_t ret = 0;
 
-	ret = import_iovec(ITER_SOURCE, vec, vlen, ARRAY_SIZE(iovstack), &iov, &iter);
-	if (ret >= 0) {
-		file_start_write(file);
-		ret = do_iter_write(file, &iter, pos, flags);
-		file_end_write(file);
-		kfree(iov);
-	}
+	if (!(file->f_mode & FMODE_WRITE))
+		return -EBADF;
+	if (!(file->f_mode & FMODE_CAN_WRITE))
+		return -EINVAL;
+
+	ret = import_iovec(ITER_SOURCE, vec, vlen, ARRAY_SIZE(iovstack), &iov,
+			   &iter);
+	if (ret < 0)
+		return ret;
+
+	tot_len = iov_iter_count(&iter);
+	if (!tot_len)
+		goto out;
+
+	ret = rw_verify_area(WRITE, file, pos, tot_len);
+	if (ret < 0)
+		goto out;
+
+	file_start_write(file);
+	if (file->f_op->write_iter)
+		ret = do_iter_readv_writev(file, &iter, pos, WRITE, flags);
+	else
+		ret = do_loop_readv_writev(file, &iter, pos, WRITE, flags);
+	if (ret > 0)
+		fsnotify_modify(file);
+	file_end_write(file);
+out:
+	kfree(iov);
 	return ret;
 }
 
@@ -1178,7 +1313,7 @@ COMPAT_SYSCALL_DEFINE6(pwritev2, compat_ulong_t, fd,
 #endif /* CONFIG_COMPAT */
 
 static ssize_t do_sendfile(int out_fd, int in_fd, loff_t *ppos,
-		  	   size_t count, loff_t max)
+			   size_t count, loff_t max)
 {
 	struct fd in, out;
 	struct inode *in_inode, *out_inode;
@@ -1250,10 +1385,8 @@ static ssize_t do_sendfile(int out_fd, int in_fd, loff_t *ppos,
 		retval = rw_verify_area(WRITE, out.file, &out_pos, count);
 		if (retval < 0)
 			goto fput_out;
-		file_start_write(out.file);
 		retval = do_splice_direct(in.file, &pos, out.file, &out_pos,
 					  count, fl);
-		file_end_write(out.file);
 	} else {
 		if (out.file->f_flags & O_NONBLOCK)
 			fl |= SPLICE_F_NONBLOCK;
@@ -1362,38 +1495,6 @@ COMPAT_SYSCALL_DEFINE4(sendfile64, int, out_fd, int, in_fd,
 }
 #endif
 
-/**
- * generic_copy_file_range - copy data between two files
- * @file_in:	file structure to read from
- * @pos_in:	file offset to read from
- * @file_out:	file structure to write data to
- * @pos_out:	file offset to write data to
- * @len:	amount of data to copy
- * @flags:	copy flags
- *
- * This is a generic filesystem helper to copy data from one file to another.
- * It has no constraints on the source or destination file owners - the files
- * can belong to different superblocks and different filesystem types. Short
- * copies are allowed.
- *
- * This should be called from the @file_out filesystem, as per the
- * ->copy_file_range() method.
- *
- * Returns the number of bytes copied or a negative error indicating the
- * failure.
- */
-
-ssize_t generic_copy_file_range(struct file *file_in, loff_t pos_in,
-				struct file *file_out, loff_t pos_out,
-				size_t len, unsigned int flags)
-{
-	lockdep_assert(sb_write_started(file_inode(file_out)->i_sb));
-
-	return do_splice_direct(file_in, &pos_in, file_out, &pos_out,
-				len > MAX_RW_COUNT ? MAX_RW_COUNT : len, 0);
-}
-EXPORT_SYMBOL(generic_copy_file_range);
-
 /*
  * Performs necessary checks before doing a file copy
  *
@@ -1478,6 +1579,7 @@ ssize_t vfs_copy_file_range(struct file *file_in, loff_t pos_in,
 {
 	ssize_t ret;
 	bool splice = flags & COPY_FILE_SPLICE;
+	bool samesb = file_inode(file_in)->i_sb == file_inode(file_out)->i_sb;
 
 	if (flags & ~COPY_FILE_SPLICE)
 		return -EINVAL;
@@ -1509,18 +1611,23 @@ ssize_t vfs_copy_file_range(struct file *file_in, loff_t pos_in,
 		ret = file_out->f_op->copy_file_range(file_in, pos_in,
 						      file_out, pos_out,
 						      len, flags);
-		goto done;
-	}
-
-	if (!splice && file_in->f_op->remap_file_range &&
-	    file_inode(file_in)->i_sb == file_inode(file_out)->i_sb) {
+	} else if (!splice && file_in->f_op->remap_file_range && samesb) {
 		ret = file_in->f_op->remap_file_range(file_in, pos_in,
 				file_out, pos_out,
 				min_t(loff_t, MAX_RW_COUNT, len),
 				REMAP_FILE_CAN_SHORTEN);
-		if (ret > 0)
-			goto done;
+		/* fallback to splice */
+		if (ret <= 0)
+			splice = true;
+	} else if (samesb) {
+		/* Fallback to splice for same sb copy for backward compat */
+		splice = true;
 	}
+
+	file_end_write(file_out);
+
+	if (!splice)
+		goto done;
 
 	/*
 	 * We can get here for same sb copy of filesystems that do not implement
@@ -1533,11 +1640,16 @@ ssize_t vfs_copy_file_range(struct file *file_in, loff_t pos_in,
 	 * and which filesystems do not, that will allow userspace tools to
 	 * make consistent desicions w.r.t using copy_file_range().
 	 *
-	 * We also get here if caller (e.g. nfsd) requested COPY_FILE_SPLICE.
+	 * We also get here if caller (e.g. nfsd) requested COPY_FILE_SPLICE
+	 * for server-side-copy between any two sb.
+	 *
+	 * In any case, we call do_splice_direct() and not splice_file_range(),
+	 * without file_start_write() held, to avoid possible deadlocks related
+	 * to splicing from input file, while file_start_write() is held on
+	 * the output file on a different sb.
 	 */
-	ret = generic_copy_file_range(file_in, pos_in, file_out, pos_out, len,
-				      flags);
-
+	ret = do_splice_direct(file_in, &pos_in, file_out, &pos_out,
+			       min_t(size_t, len, MAX_RW_COUNT), 0);
 done:
 	if (ret > 0) {
 		fsnotify_access(file_in);
@@ -1548,8 +1660,6 @@ done:
 
 	inc_syscr(current);
 	inc_syscw(current);
-
-	file_end_write(file_out);
 
 	return ret;
 }
@@ -1650,6 +1760,7 @@ int generic_write_check_limits(struct file *file, loff_t pos, loff_t *count)
 
 	return 0;
 }
+EXPORT_SYMBOL_GPL(generic_write_check_limits);
 
 /* Like generic_write_checks(), but takes size of write instead of iter. */
 int generic_write_checks_count(struct kiocb *iocb, loff_t *count)
@@ -1668,7 +1779,7 @@ int generic_write_checks_count(struct kiocb *iocb, loff_t *count)
 
 	if ((iocb->ki_flags & IOCB_NOWAIT) &&
 	    !((iocb->ki_flags & IOCB_DIRECT) ||
-	      (file->f_mode & FMODE_BUF_WASYNC)))
+	      (file->f_op->fop_flags & FOP_BUFFER_WASYNC)))
 		return -EINVAL;
 
 	return generic_write_check_limits(iocb->ki_filp, iocb->ki_pos, count);
@@ -1717,4 +1828,20 @@ int generic_file_rw_checks(struct file *file_in, struct file *file_out)
 		return -EBADF;
 
 	return 0;
+}
+
+bool generic_atomic_write_valid(struct iov_iter *iter, loff_t pos)
+{
+	size_t len = iov_iter_count(iter);
+
+	if (!iter_is_ubuf(iter))
+		return false;
+
+	if (!is_power_of_2(len))
+		return false;
+
+	if (!IS_ALIGNED(pos, len))
+		return false;
+
+	return true;
 }
